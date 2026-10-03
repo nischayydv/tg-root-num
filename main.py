@@ -1,9 +1,10 @@
 # main.py — TG Lookup API (FastAPI + Telethon)
 # Deploy on Render as: Web Service → Python
+#
 # Endpoints:
 #   GET /health
-#   GET /tg?number=XXXXXXXXXX&key=YOUR_KEY       -> plain text
-#   GET /tg/json?number=XXXXXXXXXX&key=YOUR_KEY  -> JSON
+#   GET /tg?number=XXXXXXXXXX&key=YOUR_KEY       -> plain text (clean, no emojis)
+#   GET /tg/json?number=XXXXXXXXXX&key=YOUR_KEY  -> structured JSON
 
 from __future__ import annotations
 
@@ -15,7 +16,10 @@ import sys
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Optional
+
+from dotenv import load_dotenv
+load_dotenv()
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -126,23 +130,133 @@ async def check_rate_limit(identifier: str) -> None:
         hits.append(now)
 
 
-# ─────────────── branding / header stripper ────────────────
-BRAND_PATTERNS = [
-    re.compile(r"^\s*🤖\s*ʙᴏᴛ\s*[—\-–]", re.IGNORECASE),
-    re.compile(r"^\s*ʙᴏᴛ\s*[—\-–]", re.IGNORECASE),
-    re.compile(r"@RAJFFLIVEBOT", re.IGNORECASE),
-    re.compile(r"^\s*🆔\s*user\s*info\s*🆔\s*$", re.IGNORECASE),
-    re.compile(r"^\s*ʀᴇǫᴜᴇsᴛᴇᴅ\s*ʙʏ\s*[—\-–]\s*.+$", re.IGNORECASE),
+# ═══════════════════ parser / formatter ═══════════════════
+#
+# Converts the raw bot reply (with emojis + Cyrillic-styled labels)
+# into a clean dict:
+#
+# {
+#   "name": "N/A",
+#   "username": "N/A",
+#   "telegram_id": "6846112069",
+#   "location": {
+#       "country": "India",
+#       "country_code": "+91",
+#       "phone_number": "8168784189"
+#   }
+# }
+
+# Lines to drop entirely (branding, requester, searching)
+DROP_LINE_PATTERNS = [
+    re.compile(r"^\s*🤖\s*ʙᴏᴛ\s*[—\-–]",         re.IGNORECASE),
+    re.compile(r"^\s*ʙᴏᴛ\s*[—\-–]",              re.IGNORECASE),
+    re.compile(r"@RAJFFLIVEBOT",                  re.IGNORECASE),
+    re.compile(r"^\s*ʀᴇǫᴜᴇsᴛᴇᴅ\s*ʙʏ\s*[—\-–]",  re.IGNORECASE),
+    re.compile(r"searching",                      re.IGNORECASE),
+    re.compile(r"ᴘʟᴇᴀsᴇ\s*ᴡᴀɪᴛ",                 re.IGNORECASE),
+    re.compile(r"^\s*🆔\s*user\s*info\s*🆔\s*$",  re.IGNORECASE),
+    re.compile(r"^\s*🌐\s*location\s*$",          re.IGNORECASE),
 ]
 
+# Map raw label (lowercased) → JSON key
+LABEL_MAP = {
+    "name":          "name",
+    "username":      "username",
+    "telegram id":   "telegram_id",
+    "country":       "country",
+    "country code":  "country_code",
+    "phone number":  "phone_number",
+}
 
-def strip_branding(text: str) -> str:
-    out = []
-    for line in text.splitlines():
-        if any(p.search(line) for p in BRAND_PATTERNS):
+# Try to match "🥂 telegram id — 6846112069" (any leading emoji/symbol)
+KV_RE = re.compile(
+    r"^[^\w]*(?P<label>[A-Za-z][A-Za-z ]*?)\s*[—\-–]\s*(?P<value>.+?)\s*$",
+    re.UNICODE,
+)
+
+# Emoji + flag stripper for values
+FLAG_RE  = re.compile(
+    "[\U0001F1E6-\U0001F1FF]{2}",  # regional indicator pairs (flags)
+)
+EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"  # symbols, pictographs, extended
+    "\U00002600-\U000027BF"  # misc symbols + dingbats
+    "\U0001F000-\U0001F0FF"
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def _clean_value(v: str) -> str:
+    """Strip flags/emoji, backticks, and surrounding whitespace."""
+    v = v.strip()
+    v = FLAG_RE.sub("", v)
+    v = EMOJI_RE.sub("", v)
+    v = v.replace("`", "").replace("*", "").strip()
+    v = re.sub(r"\s{2,}", " ", v)
+    return v or "N/A"
+
+
+def parse_bot_reply(raw: str) -> dict[str, Any]:
+    """Turn the raw bot text into a structured dict."""
+    flat: dict[str, str] = {}
+    order: list[str] = []
+
+    for line in raw.splitlines():
+        line = line.rstrip()
+        if not line.strip():
             continue
-        out.append(line)
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+
+        # drop branding / headers / searching notice
+        if any(p.search(line) for p in DROP_LINE_PATTERNS):
+            continue
+
+        m = KV_RE.match(line)
+        if not m:
+            continue
+
+        raw_label = m.group("label").strip().lower()
+        key = LABEL_MAP.get(raw_label)
+        if not key:
+            continue  # unknown label -> ignore
+
+        value = _clean_value(m.group("value"))
+        if key not in flat:
+            order.append(key)
+        flat[key] = value
+
+    # ── build output with stable ordering ──────────────────
+    out: dict[str, Any] = {
+        "name":        flat.get("name", "N/A"),
+        "username":    flat.get("username", "N/A"),
+        "telegram_id": flat.get("telegram_id", "N/A"),
+    }
+
+    location: dict[str, str] = {}
+    if "country"      in flat: location["country"]      = flat["country"]
+    if "country_code" in flat: location["country_code"] = flat["country_code"]
+    if "phone_number" in flat: location["phone_number"] = flat["phone_number"]
+    if location:
+        out["location"] = location
+
+    return out
+
+
+def render_plain(data: dict[str, Any]) -> str:
+    """Render the structured dict back to plain text (no emoji, no markdown)."""
+    lines = []
+    lines.append(f"name          : {data.get('name', 'N/A')}")
+    lines.append(f"username      : {data.get('username', 'N/A')}")
+    lines.append(f"telegram_id   : {data.get('telegram_id', 'N/A')}")
+    loc = data.get("location") or {}
+    if loc:
+        lines.append("")
+        lines.append("location:")
+        if "country"      in loc: lines.append(f"  country      : {loc['country']}")
+        if "country_code" in loc: lines.append(f"  country_code : {loc['country_code']}")
+        if "phone_number" in loc: lines.append(f"  phone_number : {loc['phone_number']}")
+    return "\n".join(lines)
 
 
 # ──────────────── result detection ─────────────────────────
@@ -264,7 +378,7 @@ async def tg_lookup(
         raise HTTPException(400, "Invalid phone number. Use 7–15 digits, optional leading +.")
     async with _semaphore:
         raw = await fetch_from_bot(number)
-    return strip_branding(raw)
+    return render_plain(parse_bot_reply(raw))
 
 
 @app.get("/tg/json")
@@ -282,10 +396,11 @@ async def tg_lookup_json(
             raw = await fetch_from_bot(number)
     except HTTPException:
         raise
+
     return JSONResponse({
         "success": True,
         "query": number,
-        "result": strip_branding(raw),
+        "result": parse_bot_reply(raw),
     })
 
 
