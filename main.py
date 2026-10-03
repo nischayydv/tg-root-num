@@ -1,5 +1,10 @@
 # main.py — TG Lookup API (FastAPI + Telethon)
 # Deploy on Render as: Web Service → Python
+#
+# Endpoints:
+#   GET /health
+#   GET /tg?number=<phone|@user|link>&key=YOUR_KEY        -> plain text
+#   GET /tg/json?number=<phone|@user|link>&key=YOUR_KEY   -> structured JSON
 
 from __future__ import annotations
 
@@ -100,7 +105,7 @@ async def lifespan(app: FastAPI):
             log.exception("Error during disconnect")
 
 
-app = FastAPI(title="TG Lookup API", version="1.0.1", lifespan=lifespan)
+app = FastAPI(title="TG Lookup API", version="1.1.0", lifespan=lifespan)
 
 
 # ─────────────────────── rate limiter ──────────────────────
@@ -125,6 +130,73 @@ async def check_rate_limit(identifier: str) -> None:
         hits.append(now)
 
 
+# ═══════════════════ query classifier ═════════════════════
+# Accepts one of:
+#   - phone number       →  7710199462  /  +917710199462
+#   - telegram id        →  1234567890
+#   - @username          →  @Nischay_ydv
+#   - bare username      →  Nischay_ydv
+#   - t.me link          →  https://t.me/Nischay_ydv
+#   - telegram.me link   →  telegram.me/Nischay_ydv
+#   - telegram.dog link  →  https://telegram.dog/Nischay_ydv
+
+PHONE_RE    = re.compile(r"^\+?\d{7,15}$")
+USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")   # must start with a letter, 4–32 chars
+LINK_RE     = re.compile(
+    r"^(?:https?://)?(?:t(?:elegram)?\.me|telegram\.dog)/(?P<u>[A-Za-z0-9_]{4,32})/?$",
+    re.IGNORECASE,
+)
+
+
+def classify_query(raw: str) -> tuple[str, str]:
+    """Return (kind, value) where kind ∈ {"phone", "username", "link", "invalid"}."""
+    s = (raw or "").strip()
+    if not s:
+        return "invalid", ""
+
+    # t.me / telegram.me / telegram.dog links
+    m = LINK_RE.match(s)
+    if m:
+        return "username", m.group("u")
+
+    # @username
+    if s.startswith("@"):
+        u = s[1:]
+        if USERNAME_RE.match(u):
+            return "username", u
+        return "invalid", s
+
+    # phone (all digits, optional +)
+    clean = re.sub(r"[\s\-()]", "", s)
+    if PHONE_RE.match(clean):
+        return "phone", clean
+
+    # bare username
+    if USERNAME_RE.match(s):
+        return "username", s
+
+    return "invalid", s
+
+
+async def resolve_username(username: str) -> int:
+    """Resolve a Telegram username to a numeric user/chat/channel ID."""
+    await ensure_client()
+    try:
+        entity = await client.get_entity(username)
+        return int(entity.id)
+    except errors.UsernameNotOccupiedError:
+        raise HTTPException(404, f"Username @{username} does not exist.")
+    except errors.UsernameInvalidError:
+        raise HTTPException(400, f"Username @{username} is invalid.")
+    except errors.FloodWaitError as e:
+        raise HTTPException(429, f"Telegram rate limit. Retry in {e.seconds}s.")
+    except ValueError:
+        raise HTTPException(404, f"Could not resolve @{username}.")
+    except Exception as e:
+        log.exception("resolve_username failed for %r", username)
+        raise HTTPException(500, f"Resolution failed: {type(e).__name__}")
+
+
 # ═══════════════════ parser / formatter ═══════════════════
 # Converts the raw bot reply into a clean structured dict:
 #
@@ -139,7 +211,6 @@ async def check_rate_limit(identifier: str) -> None:
 #   }
 # }
 
-# Lines to drop entirely (branding, requester, section headers, notices)
 DROP_LINE_PATTERNS = [
     re.compile(r"🤖\s*ʙᴏᴛ\s*[—\-–]",        re.IGNORECASE),
     re.compile(r"@RAJFFLIVEBOT",             re.IGNORECASE),
@@ -151,7 +222,6 @@ DROP_LINE_PATTERNS = [
     re.compile(r"🌐\s*location",             re.IGNORECASE),
 ]
 
-# Map ASCII-only label → JSON key
 LABEL_MAP = {
     "name":          "name",
     "username":      "username",
@@ -166,10 +236,8 @@ LABEL_MAP = {
     "phone":         "phone_number",
 }
 
-# Any of these dash characters can separate label from value
 DASH_CHARS = "—–-−"
 
-# Emoji / flag stripper for values
 FLAG_RE  = re.compile("[\U0001F1E6-\U0001F1FF]{2}")
 EMOJI_RE = re.compile(
     "["
@@ -184,7 +252,6 @@ EMOJI_RE = re.compile(
 
 
 def _extract_label(raw_left: str) -> str:
-    """Keep only ASCII letters + spaces from the left side of the dash."""
     kept = "".join(
         c for c in raw_left
         if (c.isascii() and c.isalpha()) or c.isspace()
@@ -193,7 +260,6 @@ def _extract_label(raw_left: str) -> str:
 
 
 def _clean_value(v: str) -> str:
-    """Strip emoji/flags/markdown, collapse whitespace."""
     v = v.strip()
     v = FLAG_RE.sub("", v)
     v = EMOJI_RE.sub("", v)
@@ -203,19 +269,15 @@ def _clean_value(v: str) -> str:
 
 
 def parse_bot_reply(raw: str) -> dict[str, Any]:
-    """Turn the raw bot text into a structured dict."""
     flat: dict[str, str] = {}
 
     for raw_line in raw.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-
-        # drop branding / header lines
         if any(p.search(line) for p in DROP_LINE_PATTERNS):
             continue
 
-        # find first dash char
         idx = -1
         for i, ch in enumerate(line):
             if ch in DASH_CHARS:
@@ -239,7 +301,6 @@ def parse_bot_reply(raw: str) -> dict[str, Any]:
 
         flat[key] = _clean_value(right)
 
-    # ── build output ───────────────────────────────────────
     out: dict[str, Any] = {
         "name":        flat.get("name", "N/A"),
         "username":    flat.get("username", "N/A"),
@@ -287,9 +348,6 @@ def looks_like_result(text: str) -> bool:
 
 
 # ──────────────────── bot conversation ─────────────────────
-PHONE_RE = re.compile(r"^\+?\d{7,15}$")
-
-
 async def fetch_from_bot(number: str) -> str:
     await ensure_client()
     try:
@@ -339,6 +397,49 @@ async def fetch_from_bot(number: str) -> str:
         raise HTTPException(500, f"Lookup failed: {type(e).__name__}")
 
 
+# ────────────── main resolver → final lookup ───────────────
+async def resolve_and_lookup(raw_query: str) -> dict[str, Any]:
+    """Given a phone / @username / link / id, resolve if needed then query the bot.
+
+    Returns:
+      {
+        "query": "<original input>",
+        "resolved_from": "@Nischay_ydv" | None,
+        "resolved_to":   "7710199462",   | None
+        "result": {...}
+      }
+    """
+    kind, value = classify_query(raw_query)
+
+    if kind == "invalid":
+        raise HTTPException(
+            400,
+            "Invalid query. Use a phone number, @username, t.me link, or Telegram ID.",
+        )
+
+    resolved_from: Optional[str] = None
+    resolved_to:   Optional[str] = None
+
+    if kind == "username":
+        # resolve @username / link → numeric id
+        user_id = await resolve_username(value)
+        resolved_from = f"@{value}"
+        resolved_to = str(user_id)
+        target = str(user_id)
+    else:
+        target = value  # phone
+
+    async with _semaphore:
+        raw = await fetch_from_bot(target)
+
+    return {
+        "query": raw_query,
+        "resolved_from": resolved_from,
+        "resolved_to":   resolved_to,
+        "result": parse_bot_reply(raw),
+    }
+
+
 # ───────────────────── auth dependency ─────────────────────
 def _client_id(request: Request) -> str:
     fwd = request.headers.get("x-forwarded-for", "")
@@ -360,12 +461,17 @@ async def auth_and_limit(request: Request, key: str = "") -> str:
 async def root():
     return {
         "name": "TG Lookup API",
-        "version": "1.0.1",
+        "version": "1.1.0",
         "endpoints": {
-            "plain": "/tg?number=XXXXXXXXXX&key=YOUR_KEY",
-            "json":  "/tg/json?number=XXXXXXXXXX&key=YOUR_KEY",
+            "plain": "/tg?number=<phone|@user|link>&key=YOUR_KEY",
+            "json":  "/tg/json?number=<phone|@user|link>&key=YOUR_KEY",
             "health": "/health",
         },
+        "examples": [
+            "/tg/json?number=7710199462&key=YOUR_KEY",
+            "/tg/json?number=%40Nischay_ydv&key=YOUR_KEY",
+            "/tg/json?number=https%3A%2F%2Ft.me%2FNischay_ydv&key=YOUR_KEY",
+        ],
     }
 
 
@@ -382,38 +488,29 @@ async def health():
 @app.get("/tg", response_class=PlainTextResponse)
 async def tg_lookup(
     request: Request,
-    number: str = Query(..., description="Phone number, e.g. 8168784189"),
+    number: str = Query(..., description="Phone number, @username, or t.me link"),
     key: str = Query("", description="API key if configured"),
 ):
     await auth_and_limit(request, key)
-    number = re.sub(r"[\s\-()]", "", number or "")
-    if not PHONE_RE.match(number):
-        raise HTTPException(400, "Invalid phone number. Use 7–15 digits, optional leading +.")
-    async with _semaphore:
-        raw = await fetch_from_bot(number)
-    return render_plain(parse_bot_reply(raw))
+    data = await resolve_and_lookup(number)
+    return render_plain(data["result"])
 
 
 @app.get("/tg/json")
 async def tg_lookup_json(
     request: Request,
-    number: str = Query(...),
+    number: str = Query(..., description="Phone number, @username, or t.me link"),
     key: str = Query(""),
 ):
     await auth_and_limit(request, key)
-    number = re.sub(r"[\s\-()]", "", number or "")
-    if not PHONE_RE.match(number):
-        raise HTTPException(400, "Invalid phone number. Use 7–15 digits, optional leading +.")
-    try:
-        async with _semaphore:
-            raw = await fetch_from_bot(number)
-    except HTTPException:
-        raise
+    data = await resolve_and_lookup(number)
 
     return JSONResponse({
         "success": True,
         "query": number,
-        "result": parse_bot_reply(raw),
+        "resolved_from": data["resolved_from"],
+        "resolved_to":   data["resolved_to"],
+        "result":        data["result"],
     })
 
 
