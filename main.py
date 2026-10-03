@@ -1,10 +1,5 @@
 # main.py — TG Lookup API (FastAPI + Telethon)
 # Deploy on Render as: Web Service → Python
-#
-# Endpoints:
-#   GET /health
-#   GET /tg?number=XXXXXXXXXX&key=YOUR_KEY       -> plain text (clean, no emojis)
-#   GET /tg/json?number=XXXXXXXXXX&key=YOUR_KEY  -> structured JSON
 
 from __future__ import annotations
 
@@ -105,7 +100,7 @@ async def lifespan(app: FastAPI):
             log.exception("Error during disconnect")
 
 
-app = FastAPI(title="TG Lookup API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="TG Lookup API", version="1.0.1", lifespan=lifespan)
 
 
 # ─────────────────────── rate limiter ──────────────────────
@@ -131,65 +126,74 @@ async def check_rate_limit(identifier: str) -> None:
 
 
 # ═══════════════════ parser / formatter ═══════════════════
-#
-# Converts the raw bot reply (with emojis + Cyrillic-styled labels)
-# into a clean dict:
+# Converts the raw bot reply into a clean structured dict:
 #
 # {
 #   "name": "N/A",
 #   "username": "N/A",
-#   "telegram_id": "6846112069",
+#   "telegram_id": "7710199462",
 #   "location": {
-#       "country": "India",
-#       "country_code": "+91",
-#       "phone_number": "8168784189"
+#     "country": "India",
+#     "country_code": "+91",
+#     "phone_number": "8278330781"
 #   }
 # }
 
-# Lines to drop entirely (branding, requester, searching)
+# Lines to drop entirely (branding, requester, section headers, notices)
 DROP_LINE_PATTERNS = [
-    re.compile(r"^\s*🤖\s*ʙᴏᴛ\s*[—\-–]",         re.IGNORECASE),
-    re.compile(r"^\s*ʙᴏᴛ\s*[—\-–]",              re.IGNORECASE),
-    re.compile(r"@RAJFFLIVEBOT",                  re.IGNORECASE),
-    re.compile(r"^\s*ʀᴇǫᴜᴇsᴛᴇᴅ\s*ʙʏ\s*[—\-–]",  re.IGNORECASE),
-    re.compile(r"searching",                      re.IGNORECASE),
-    re.compile(r"ᴘʟᴇᴀsᴇ\s*ᴡᴀɪᴛ",                 re.IGNORECASE),
-    re.compile(r"^\s*🆔\s*user\s*info\s*🆔\s*$",  re.IGNORECASE),
-    re.compile(r"^\s*🌐\s*location\s*$",          re.IGNORECASE),
+    re.compile(r"🤖\s*ʙᴏᴛ\s*[—\-–]",        re.IGNORECASE),
+    re.compile(r"@RAJFFLIVEBOT",             re.IGNORECASE),
+    re.compile(r"ʀᴇǫᴜᴇsᴛᴇᴅ\s*ʙʏ",           re.IGNORECASE),
+    re.compile(r"searching",                 re.IGNORECASE),
+    re.compile(r"ᴘʟᴇᴀsᴇ\s*ᴡᴀɪᴛ",            re.IGNORECASE),
+    re.compile(r"please\s+wait",             re.IGNORECASE),
+    re.compile(r"🆔\s*user\s*info\s*🆔",     re.IGNORECASE),
+    re.compile(r"🌐\s*location",             re.IGNORECASE),
 ]
 
-# Map raw label (lowercased) → JSON key
+# Map ASCII-only label → JSON key
 LABEL_MAP = {
     "name":          "name",
     "username":      "username",
     "telegram id":   "telegram_id",
+    "telegramid":    "telegram_id",
+    "id":            "telegram_id",
     "country":       "country",
     "country code":  "country_code",
+    "countrycode":   "country_code",
     "phone number":  "phone_number",
+    "phonenumber":   "phone_number",
+    "phone":         "phone_number",
 }
 
-# Try to match "🥂 telegram id — 6846112069" (any leading emoji/symbol)
-KV_RE = re.compile(
-    r"^[^\w]*(?P<label>[A-Za-z][A-Za-z ]*?)\s*[—\-–]\s*(?P<value>.+?)\s*$",
-    re.UNICODE,
-)
+# Any of these dash characters can separate label from value
+DASH_CHARS = "—–-−"
 
-# Emoji + flag stripper for values
-FLAG_RE  = re.compile(
-    "[\U0001F1E6-\U0001F1FF]{2}",  # regional indicator pairs (flags)
-)
+# Emoji / flag stripper for values
+FLAG_RE  = re.compile("[\U0001F1E6-\U0001F1FF]{2}")
 EMOJI_RE = re.compile(
     "["
-    "\U0001F300-\U0001FAFF"  # symbols, pictographs, extended
-    "\U00002600-\U000027BF"  # misc symbols + dingbats
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
     "\U0001F000-\U0001F0FF"
+    "\U0000FE00-\U0000FE0F"
+    "\U0001F900-\U0001F9FF"
     "]+",
     flags=re.UNICODE,
 )
 
 
+def _extract_label(raw_left: str) -> str:
+    """Keep only ASCII letters + spaces from the left side of the dash."""
+    kept = "".join(
+        c for c in raw_left
+        if (c.isascii() and c.isalpha()) or c.isspace()
+    )
+    return " ".join(kept.split()).lower()
+
+
 def _clean_value(v: str) -> str:
-    """Strip flags/emoji, backticks, and surrounding whitespace."""
+    """Strip emoji/flags/markdown, collapse whitespace."""
     v = v.strip()
     v = FLAG_RE.sub("", v)
     v = EMOJI_RE.sub("", v)
@@ -201,32 +205,41 @@ def _clean_value(v: str) -> str:
 def parse_bot_reply(raw: str) -> dict[str, Any]:
     """Turn the raw bot text into a structured dict."""
     flat: dict[str, str] = {}
-    order: list[str] = []
 
-    for line in raw.splitlines():
-        line = line.rstrip()
-        if not line.strip():
+    for raw_line in raw.splitlines():
+        line = raw_line.strip()
+        if not line:
             continue
 
-        # drop branding / headers / searching notice
+        # drop branding / header lines
         if any(p.search(line) for p in DROP_LINE_PATTERNS):
             continue
 
-        m = KV_RE.match(line)
-        if not m:
+        # find first dash char
+        idx = -1
+        for i, ch in enumerate(line):
+            if ch in DASH_CHARS:
+                idx = i
+                break
+        if idx == -1:
             continue
 
-        raw_label = m.group("label").strip().lower()
-        key = LABEL_MAP.get(raw_label)
+        left  = line[:idx]
+        right = line[idx + 1:].strip()
+        if not right:
+            continue
+
+        label = _extract_label(left)
+        if not label:
+            continue
+
+        key = LABEL_MAP.get(label)
         if not key:
-            continue  # unknown label -> ignore
+            continue
 
-        value = _clean_value(m.group("value"))
-        if key not in flat:
-            order.append(key)
-        flat[key] = value
+        flat[key] = _clean_value(right)
 
-    # ── build output with stable ordering ──────────────────
+    # ── build output ───────────────────────────────────────
     out: dict[str, Any] = {
         "name":        flat.get("name", "N/A"),
         "username":    flat.get("username", "N/A"),
@@ -244,11 +257,11 @@ def parse_bot_reply(raw: str) -> dict[str, Any]:
 
 
 def render_plain(data: dict[str, Any]) -> str:
-    """Render the structured dict back to plain text (no emoji, no markdown)."""
-    lines = []
-    lines.append(f"name          : {data.get('name', 'N/A')}")
-    lines.append(f"username      : {data.get('username', 'N/A')}")
-    lines.append(f"telegram_id   : {data.get('telegram_id', 'N/A')}")
+    lines = [
+        f"name          : {data.get('name', 'N/A')}",
+        f"username      : {data.get('username', 'N/A')}",
+        f"telegram_id   : {data.get('telegram_id', 'N/A')}",
+    ]
     loc = data.get("location") or {}
     if loc:
         lines.append("")
@@ -347,7 +360,7 @@ async def auth_and_limit(request: Request, key: str = "") -> str:
 async def root():
     return {
         "name": "TG Lookup API",
-        "version": "1.0.0",
+        "version": "1.0.1",
         "endpoints": {
             "plain": "/tg?number=XXXXXXXXXX&key=YOUR_KEY",
             "json":  "/tg/json?number=XXXXXXXXXX&key=YOUR_KEY",
